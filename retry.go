@@ -15,11 +15,13 @@ import (
 	"time"
 )
 
-// Default delays for a Backoff call whose BackoffArgs leave them zero.
-const (
-	DefaultInitialDelay = 100 * time.Millisecond
-	DefaultMaxDelay     = 30 * time.Second
-)
+// DefaultInitialDelay is the wait before the second attempt of a Backoff
+// call whose BackoffArgs.InitialDelay is zero or negative.
+const DefaultInitialDelay = 100 * time.Millisecond
+
+// DefaultMaxDelay caps the doubling of a Backoff call whose
+// BackoffArgs.MaxDelay is zero or negative.
+const DefaultMaxDelay = 30 * time.Second
 
 // BackoffArgs configures a single Backoff call.
 type BackoffArgs struct {
@@ -144,9 +146,9 @@ type RateLimitedArgs struct {
 	// Operation is the request. It runs at least once. Required.
 	Operation func() error
 	// RetryAfter reports whether an error is the server's 429 Too Many
-	// Requests refusal, and the wait its Retry-After asks for, 0 when it names none.
-	// Any other error, a dropped connection included, ends the call.
-	// Required.
+	// Requests refusal, and the wait its Retry-After asks for, 0 when it
+	// names none. Any other error, a dropped connection included, ends the
+	// call. Required.
 	RetryAfter func(error) (time.Duration, bool)
 	// Wait bounds the time spent retrying: a retry whose wait would end
 	// past it is not made. Zero or negative uses DefaultRateLimitWait.

@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -54,17 +55,23 @@ func TestBackoffReturnsPermanentErrorImmediately(t *testing.T) {
 }
 
 func TestBackoffStopsOnContextDeadline(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
-	err := Backoff(ctx, &BackoffArgs{
-		Operation:    func() error { return errors.New("still down") },
-		Transient:    func(error) bool { return true },
-		InitialDelay: 5 * time.Millisecond,
-		MaxDelay:     10 * time.Millisecond,
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+		started := time.Now()
+		err := Backoff(ctx, &BackoffArgs{
+			Operation:    func() error { return errors.New("still down") },
+			Transient:    func(error) bool { return true },
+			InitialDelay: 5 * time.Second,
+			MaxDelay:     10 * time.Second,
+		})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Backoff error = %v, want the context deadline", err)
+		}
+		if elapsed := time.Since(started); elapsed != 20*time.Second {
+			t.Fatalf("Backoff returned after %s, want 20s, at the deadline", elapsed)
+		}
 	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Backoff error = %v, want the context deadline", err)
-	}
 }
 
 func TestTransientHTTP(t *testing.T) {
@@ -224,44 +231,57 @@ func rateLimitedRetryAfter(err error) (time.Duration, bool) {
 // up on one still refused when the wait runs out, and never sends again a
 // request that failed another way.
 func TestRateLimited(t *testing.T) {
-	attempts := 0
-	err := RateLimited(t.Context(), &RateLimitedArgs{
-		Operation: func() error {
-			attempts++
-			if attempts < 3 {
-				return errRateLimited
-			}
-			return nil
-		},
-		RetryAfter: rateLimitedRetryAfter,
-		Wait:       time.Second,
-		Delay:      time.Millisecond,
-	})
-	if err != nil || attempts != 3 {
-		t.Fatalf("after two refusals: %v in %d attempts, want success in 3", err, attempts)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		attempts := 0
+		err := RateLimited(t.Context(), &RateLimitedArgs{
+			Operation: func() error {
+				attempts++
+				if attempts < 3 {
+					return errRateLimited
+				}
+				return nil
+			},
+			RetryAfter: rateLimitedRetryAfter,
+			Wait:       time.Minute,
+			Delay:      time.Second,
+		})
+		if err != nil || attempts != 3 {
+			t.Fatalf("after two refusals: %v in %d attempts, want success in 3", err, attempts)
+		}
 
-	attempts = 0
-	err = RateLimited(t.Context(), &RateLimitedArgs{
-		Operation:  func() error { attempts++; return errRateLimited },
-		RetryAfter: rateLimitedRetryAfter,
-		Wait:       50 * time.Millisecond,
-		Delay:      10 * time.Millisecond,
-	})
-	if !errors.Is(err, errRateLimited) || attempts < 2 || attempts > 6 {
-		t.Fatalf("past the wait: %v in %d attempts, want the refusal after a few", err, attempts)
-	}
+		// Each wait is 10s jittered into [10s, 15s), so a 50s bound allows
+		// three to five retries after the first attempt, and never a wait
+		// that ends past the bound.
+		attempts = 0
+		started := time.Now()
+		err = RateLimited(t.Context(), &RateLimitedArgs{
+			Operation:  func() error { attempts++; return errRateLimited },
+			RetryAfter: rateLimitedRetryAfter,
+			Wait:       50 * time.Second,
+			Delay:      10 * time.Second,
+		})
+		if !errors.Is(err, errRateLimited) || attempts < 4 || attempts > 6 {
+			t.Fatalf(
+				"past the wait: %v in %d attempts, want the refusal after 4 to 6",
+				err,
+				attempts,
+			)
+		}
+		if elapsed := time.Since(started); elapsed > 50*time.Second {
+			t.Fatalf("past the wait: returned after %s, want at most 50s", elapsed)
+		}
 
-	dropped := errors.New("connection reset by peer")
-	attempts = 0
-	err = RateLimited(t.Context(), &RateLimitedArgs{
-		Operation:  func() error { attempts++; return dropped },
-		RetryAfter: rateLimitedRetryAfter,
-		Delay:      time.Millisecond,
+		dropped := errors.New("connection reset by peer")
+		attempts = 0
+		err = RateLimited(t.Context(), &RateLimitedArgs{
+			Operation:  func() error { attempts++; return dropped },
+			RetryAfter: rateLimitedRetryAfter,
+			Delay:      time.Second,
+		})
+		if !errors.Is(err, dropped) || attempts != 1 {
+			t.Fatalf("a dropped connection: %v in %d attempts, want it once", err, attempts)
+		}
 	})
-	if !errors.Is(err, dropped) || attempts != 1 {
-		t.Fatalf("a dropped connection: %v in %d attempts, want it once", err, attempts)
-	}
 }
 
 // TestRateLimitedHugeRetryAfter checks that a Retry-After too large to add
@@ -276,13 +296,21 @@ func TestRateLimitedHugeRetryAfter(t *testing.T) {
 		RetryAfter: func(error) (time.Duration, bool) { return time.Duration(math.MaxInt64), true },
 	})
 	if !errors.Is(err, errRateLimited) || attempts != 1 {
-		t.Fatalf("a huge Retry-After: %d attempts, %v", attempts, err)
+		t.Fatalf("a huge Retry-After: %v in %d attempts, want the refusal once", err, attempts)
 	}
 }
 
 // TestTransientHTTPBounds checks the edges of the retryable class.
 func TestTransientHTTPBounds(t *testing.T) {
-	for statusCode, want := range map[int]bool{499: false, 500: true, 501: false, 599: true, 600: false, 999: false} {
+	boundaries := map[int]bool{
+		499: false,
+		500: true,
+		501: false,
+		599: true,
+		600: false,
+		999: false,
+	}
+	for statusCode, want := range boundaries {
 		if got := TransientHTTP(statusCode); got != want {
 			t.Errorf("TransientHTTP(%d) = %v, want %v", statusCode, got, want)
 		}
