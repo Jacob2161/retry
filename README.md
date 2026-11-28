@@ -30,4 +30,4 @@ err := retry.Backoff(ctx, &retry.BackoffArgs{
   effect.
 - There is no total time limit of its own: give it a context with a deadline.
 
-Tested on the two newest Go releases. Licensed under the MIT license.
+Requires Go 1.27. Licensed under the MIT license.
